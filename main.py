@@ -8,7 +8,7 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-app = FastAPI(title="Gevel Calculator API - Opening Detection")
+app = FastAPI(title="Gevel Calculator API - Facade Detection")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,10 +18,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+MARKER_REAL_HEIGHT_CM = 40.0
 
-# =========================
-# Basics
-# =========================
 
 def read_upload_image(file_bytes: bytes) -> np.ndarray:
     arr = np.frombuffer(file_bytes, dtype=np.uint8)
@@ -31,577 +29,382 @@ def read_upload_image(file_bytes: bytes) -> np.ndarray:
     return img
 
 
-def resize_for_processing(image: np.ndarray, max_dim: int = 1800) -> tuple[np.ndarray, float]:
+def resize_for_processing(image: np.ndarray, max_dim: int = 1600) -> tuple[np.ndarray, float]:
     h, w = image.shape[:2]
-    largest = max(h, w)
-
-    if largest <= max_dim:
+    scale = min(max_dim / max(h, w), 1.0)
+    if scale == 1.0:
         return image.copy(), 1.0
-
-    scale = max_dim / float(largest)
-    new_w = int(round(w * scale))
-    new_h = int(round(h * scale))
-    resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(image, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
     return resized, scale
 
 
-def clip_box(x: int, y: int, w: int, h: int, img_w: int, img_h: int) -> dict[str, int]:
-    x = max(0, x)
-    y = max(0, y)
+def clamp_int(value: float) -> int:
+    return int(round(value))
+
+
+def safe_box(x: int, y: int, w: int, h: int, img_w: int, img_h: int) -> tuple[int, int, int, int]:
+    x = max(0, min(x, img_w - 1))
+    y = max(0, min(y, img_h - 1))
     w = max(1, min(w, img_w - x))
     h = max(1, min(h, img_h - y))
-    return {"x": int(x), "y": int(y), "width": int(w), "height": int(h)}
+    return x, y, w, h
 
 
-def iou(a: dict[str, int], b: dict[str, int]) -> float:
-    ax1, ay1 = a["x"], a["y"]
-    ax2, ay2 = a["x"] + a["width"], a["y"] + a["height"]
-
-    bx1, by1 = b["x"], b["y"]
-    bx2, by2 = b["x"] + b["width"], b["y"] + b["height"]
-
-    inter_x1 = max(ax1, bx1)
-    inter_y1 = max(ay1, by1)
-    inter_x2 = min(ax2, bx2)
-    inter_y2 = min(ay2, by2)
-
-    inter_w = max(0, inter_x2 - inter_x1)
-    inter_h = max(0, inter_y2 - inter_y1)
-    inter_area = inter_w * inter_h
-
-    if inter_area <= 0:
-        return 0.0
-
-    area_a = a["width"] * a["height"]
-    area_b = b["width"] * b["height"]
-    union = area_a + area_b - inter_area
-
-    if union <= 0:
-        return 0.0
-
-    return inter_area / union
-
-
-def non_max_suppression(
-    boxes: list[dict[str, Any]],
-    iou_threshold: float = 0.28,
-) -> list[dict[str, Any]]:
-    if not boxes:
-        return []
-
-    boxes = sorted(boxes, key=lambda b: b["score"], reverse=True)
-    kept: list[dict[str, Any]] = []
-
-    for box in boxes:
-        keep = True
-        for existing in kept:
-            if iou(box, existing) > iou_threshold:
-                keep = False
-                break
-        if keep:
-            kept.append(box)
-
-    return kept
-
-
-def expand_box(
-    x: int,
-    y: int,
-    w: int,
-    h: int,
-    pad_x: float,
-    pad_y: float,
-    img_w: int,
-    img_h: int,
-) -> tuple[int, int, int, int]:
-    px = int(round(w * pad_x))
-    py = int(round(h * pad_y))
-
-    nx = max(0, x - px)
-    ny = max(0, y - py)
-    nx2 = min(img_w, x + w + px)
-    ny2 = min(img_h, y + h + py)
-
-    return nx, ny, nx2 - nx, ny2 - ny
-
-
-# =========================
-# Feature helpers
-# =========================
-
-def get_edge_density(edge_img: np.ndarray, x: int, y: int, w: int, h: int) -> float:
-    roi = edge_img[y:y + h, x:x + w]
-    if roi.size == 0:
-        return 0.0
-    return float(np.mean(roi > 0))
-
-
-def get_ring_strength(edge_img: np.ndarray, x: int, y: int, w: int, h: int, thickness: int = 6) -> float:
-    roi = edge_img[y:y + h, x:x + w]
-    if roi.size == 0 or w <= 2 * thickness or h <= 2 * thickness:
-        return 0.0
-
-    mask = np.zeros((h, w), dtype=np.uint8)
-    mask[:thickness, :] = 1
-    mask[-thickness:, :] = 1
-    mask[:, :thickness] = 1
-    mask[:, -thickness:] = 1
-
-    values = roi[mask == 1]
-    if values.size == 0:
-        return 0.0
-
-    return float(np.mean(values > 0))
-
-
-def get_rectangularity(cnt: np.ndarray) -> float:
-    area = cv2.contourArea(cnt)
-    if area <= 0:
-        return 0.0
-    x, y, w, h = cv2.boundingRect(cnt)
-    rect_area = w * h
-    if rect_area <= 0:
-        return 0.0
-    return float(area / rect_area)
-
-
-def get_inner_outer_stats(gray: np.ndarray, x: int, y: int, w: int, h: int) -> tuple[float, float, float]:
-    roi = gray[y:y + h, x:x + w]
-    if roi.size == 0 or w < 12 or h < 12:
-        return 0.0, 0.0, 0.0
-
-    t = max(4, min(w, h) // 10)
-
-    mask_border = np.zeros((h, w), dtype=np.uint8)
-    mask_border[:t, :] = 1
-    mask_border[-t:, :] = 1
-    mask_border[:, :t] = 1
-    mask_border[:, -t:] = 1
-
-    mask_inner = np.ones((h, w), dtype=np.uint8)
-    mask_inner[:t, :] = 0
-    mask_inner[-t:, :] = 0
-    mask_inner[:, :t] = 0
-    mask_inner[:, -t:] = 0
-
-    border_vals = roi[mask_border == 1]
-    inner_vals = roi[mask_inner == 1]
-
-    if border_vals.size == 0 or inner_vals.size == 0:
-        return 0.0, 0.0, 0.0
-
-    border_mean = float(np.mean(border_vals))
-    inner_mean = float(np.mean(inner_vals))
-    inner_std = float(np.std(inner_vals))
-    return border_mean, inner_mean, inner_std
-
-
-def count_long_lines(edge_roi: np.ndarray, w: int, h: int) -> tuple[int, int]:
-    lines = cv2.HoughLinesP(
-        edge_roi,
-        1,
-        np.pi / 180,
-        threshold=max(16, min(w, h) // 4),
-        minLineLength=max(16, min(w, h) // 3),
-        maxLineGap=8,
-    )
-
-    if lines is None:
-        return 0, 0
-
-    vertical = 0
-    horizontal = 0
-
-    for line in lines[:, 0]:
-        x1, y1, x2, y2 = line
-        dx = abs(x2 - x1)
-        dy = abs(y2 - y1)
-
-        if dx <= 5 and dy >= h * 0.30:
-            vertical += 1
-        elif dy <= 5 and dx >= w * 0.30:
-            horizontal += 1
-
-    return vertical, horizontal
-
-
-# =========================
-# Gevel/opening pipeline
-# =========================
-
-def estimate_facade_mask(image_bgr: np.ndarray) -> np.ndarray:
+def estimate_marker_hsv_range(marker_img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
-    Benadert grote, samenhangende gevelmassa.
-    Niet perfect, maar nuttig om lucht/grond/omgeving te reduceren.
+    Leidt een HSV-range af uit de geüploade markerfoto.
+    We nemen de meest verzadigde/geel-groene pixels als referentie.
     """
-    h, w = image_bgr.shape[:2]
+    hsv = cv2.cvtColor(marker_img, cv2.COLOR_BGR2HSV)
 
-    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
+    # Fluokleuren zijn meestal hoge saturatie + hoge helderheid
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
 
-    # Egaliseren zodat baksteen/crepi/hout wat consistenter wordt
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    l_eq = clahe.apply(l)
+    strong_mask = (sat > 80) & (val > 80)
+    pixels = hsv[strong_mask]
 
-    # Zachte clustering op kleur + licht
-    features = np.stack(
-        [
-            l_eq.reshape(-1).astype(np.float32),
-            a.reshape(-1).astype(np.float32),
-            b.reshape(-1).astype(np.float32),
-        ],
-        axis=1,
-    )
+    if len(pixels) < 50:
+        # fallback-range voor fluogeel / geelgroen
+        lower = np.array([18, 70, 70], dtype=np.uint8)
+        upper = np.array([48, 255, 255], dtype=np.uint8)
+        return lower, upper
 
-    criteria = (
-        cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
-        20,
-        1.0,
-    )
+    # Focus op dominante hue
+    hues = pixels[:, 0]
+    median_h = int(np.median(hues))
 
-    k = 4
-    _ret, labels, centers = cv2.kmeans(
-        features,
-        k,
-        None,
-        criteria,
-        5,
-        cv2.KMEANS_PP_CENTERS,
-    )
+    lower_h = max(0, median_h - 12)
+    upper_h = min(179, median_h + 12)
 
-    label_img = labels.reshape(h, w)
-
-    # Kies cluster die het meest "gevelachtig" is:
-    # groot, centraal, en niet te donker
-    best_label = 0
-    best_score = -1e9
-
-    yy, xx = np.mgrid[0:h, 0:w]
-    cx = w / 2.0
-    cy = h / 2.0
-
-    for i in range(k):
-        mask = (label_img == i).astype(np.uint8)
-        area = int(mask.sum())
-        if area <= 0:
-            continue
-
-        ys, xs = np.where(mask > 0)
-        mean_x = float(np.mean(xs))
-        mean_y = float(np.mean(ys))
-
-        dist_center = ((mean_x - cx) ** 2 + (mean_y - cy) ** 2) ** 0.5
-        l_mean = float(np.mean(l_eq[mask > 0]))
-
-        score = 0.0
-        score += area * 1.0
-        score -= dist_center * 120.0
-        score += l_mean * 50.0
-
-        if score > best_score:
-            best_score = score
-            best_label = i
-
-    facade_mask = (label_img == best_label).astype(np.uint8) * 255
-
-    # Morphologische opschoning
-    facade_mask = cv2.morphologyEx(
-        facade_mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (21, 21)),
-        iterations=2,
-    )
-    facade_mask = cv2.morphologyEx(
-        facade_mask,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9)),
-        iterations=1,
-    )
-
-    # Enkel grootste component houden
-    num_labels, labels_cc, stats, _ = cv2.connectedComponentsWithStats(facade_mask, connectivity=8)
-    if num_labels <= 1:
-        return facade_mask
-
-    best_idx = 1
-    best_area = 0
-    for i in range(1, num_labels):
-        area = stats[i, cv2.CC_STAT_AREA]
-        if area > best_area:
-            best_area = area
-            best_idx = i
-
-    facade_mask = np.where(labels_cc == best_idx, 255, 0).astype(np.uint8)
-    return facade_mask
+    lower = np.array([lower_h, 60, 60], dtype=np.uint8)
+    upper = np.array([upper_h, 255, 255], dtype=np.uint8)
+    return lower, upper
 
 
-def detect_openings_from_facade(image_bgr: np.ndarray) -> list[dict[str, Any]]:
-    original_h, original_w = image_bgr.shape[:2]
-    proc_img, scale = resize_for_processing(image_bgr, max_dim=1800)
-    proc_h, proc_w = proc_img.shape[:2]
-    image_area = proc_w * proc_h
+def detect_marker(image_bgr: np.ndarray, marker_img_bgr: np.ndarray | None) -> dict[str, Any] | None:
+    """
+    Detecteert een smalle verticale fluogele marker in de geüploade foto.
+    """
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
 
-    gray = cv2.cvtColor(proc_img, cv2.COLOR_BGR2GRAY)
-    gray_blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    if marker_img_bgr is not None:
+        lower, upper = estimate_marker_hsv_range(marker_img_bgr)
+    else:
+        lower = np.array([18, 70, 70], dtype=np.uint8)
+        upper = np.array([48, 255, 255], dtype=np.uint8)
 
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray_eq = clahe.apply(gray_blur)
+    mask = cv2.inRange(hsv, lower, upper)
 
-    edges = cv2.Canny(gray_eq, 60, 160)
-    edges = cv2.morphologyEx(
-        edges,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
-        iterations=1,
-    )
+    kernel_open = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    kernel_close = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 11))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel_open, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel_close, iterations=2)
 
-    facade_mask = estimate_facade_mask(proc_img)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # "Afwijkingen" t.o.v. lokaal gevelgedrag
-    local_mean = cv2.blur(gray_eq, (41, 41))
-    diff = cv2.absdiff(gray_eq, local_mean)
-
-    # Binnen de gevel zoeken
-    diff_in_facade = cv2.bitwise_and(diff, diff, mask=facade_mask)
-
-    _, dev_mask = cv2.threshold(diff_in_facade, 18, 255, cv2.THRESH_BINARY)
-
-    # Ook rechte randen binnen de gevel meenemen
-    edge_in_facade = cv2.bitwise_and(edges, edges, mask=facade_mask)
-
-    structure = cv2.morphologyEx(
-        edge_in_facade,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
-        iterations=2,
-    )
-
-    opening_mask = cv2.bitwise_or(dev_mask, structure)
-
-    opening_mask = cv2.morphologyEx(
-        opening_mask,
-        cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (11, 11)),
-        iterations=2,
-    )
-    opening_mask = cv2.morphologyEx(
-        opening_mask,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
-        iterations=1,
-    )
-
-    contours, _ = cv2.findContours(opening_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    candidates: list[dict[str, Any]] = []
+    best = None
+    best_score = -1.0
+    img_h, img_w = image_bgr.shape[:2]
+    image_area = img_h * img_w
 
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area < image_area * 0.0015:
-            continue
-        if area > image_area * 0.28:
+        if area < image_area * 0.0002:
             continue
 
         x, y, w, h = cv2.boundingRect(cnt)
-
-        if w < 35 or h < 35:
+        if h <= 0 or w <= 0:
             continue
 
-        rect_area = w * h
-        if rect_area <= 0:
-            continue
+        aspect = h / max(w, 1)
+        fill_ratio = area / max(w * h, 1)
 
-        fill_ratio = area / float(rect_area)
-        if fill_ratio < 0.20:
-            continue
-
-        aspect_ratio = w / float(h)
-        if aspect_ratio < 0.22 or aspect_ratio > 3.2:
-            continue
-
-        border_touch = x <= 2 or y <= 2 or x + w >= proc_w - 2 or y + h >= proc_h - 2
-        if border_touch:
-            continue
-
-        # Kandidaten moeten grotendeels in de gevel liggen
-        roi_facade = facade_mask[y:y + h, x:x + w]
-        facade_fraction = float(np.mean(roi_facade > 0)) if roi_facade.size > 0 else 0.0
-        if facade_fraction < 0.55:
-            continue
-
-        rectangularity = get_rectangularity(cnt)
-
-        roi_edges = edge_in_facade[y:y + h, x:x + w]
-        edge_density = get_edge_density(edge_in_facade, x, y, w, h)
-        ring_strength = get_ring_strength(
-            edge_in_facade,
-            x,
-            y,
-            w,
-            h,
-            thickness=max(4, min(w, h) // 16),
-        )
-
-        border_mean, inner_mean, inner_std = get_inner_outer_stats(gray_eq, x, y, w, h)
-        vertical_lines, horizontal_lines = count_long_lines(roi_edges, w, h)
-
-        bottom_ratio = (y + h) / float(proc_h)
-        top_ratio = y / float(proc_h)
-        height_ratio = h / float(proc_h)
-        width_ratio = w / float(proc_w)
-
+        # Marker moet eerder smal en verticaal zijn
         score = 0.0
+        score += min(area / image_area * 3000, 8.0)
+        score += min(aspect, 12.0) * 1.5
+        score += fill_ratio * 3.0
 
-        # Sterke rechthoek / openingvorm
-        score += rectangularity * 2.8
-        score += fill_ratio * 1.6
+        # lichte bonus als hij niet volledig bovenaan of volledig onderaan staat
+        cy = y + h / 2
+        center_bonus = 1.0 - abs(cy - img_h / 2) / (img_h / 2)
+        score += max(center_bonus, 0) * 1.5
 
-        # Rechte randen / kozijngevoel
-        score += edge_density * 4.0
-        score += ring_strength * 5.0
-        score += min(vertical_lines, 4) * 0.35
-        score += min(horizontal_lines, 4) * 0.35
+        if aspect < 2.5:
+            score -= 6.0
 
-        # Binnenkant wijkt af van rand/gevel
-        border_inner_diff = abs(border_mean - inner_mean)
-        score += min(2.2, border_inner_diff / 20.0)
-        score += min(1.8, inner_std / 20.0)
-
-        # Verhoudingen die vaak bij ramen voorkomen
-        preferred_ratios = [0.35, 0.5, 0.7, 0.9, 1.2, 1.6, 2.0]
-        ratio_distance = min(abs(aspect_ratio - r) for r in preferred_ratios)
-        score += max(0.0, 1.2 - ratio_distance)
-
-        # Te grote vlakken zijn vaak hele zones van muur/schaduw
-        if width_ratio > 0.55:
-            score -= 1.2
-        if height_ratio > 0.70:
-            score -= 1.2
-
-        # Zeer lage en hoge smalle opening = eerder deur
-        door_like = False
-        if bottom_ratio > 0.90 and height_ratio > 0.28 and aspect_ratio < 1.0:
-            door_like = True
-
-        # Heel hoog bovenaan tegen dakzone is verdacht
-        if top_ratio < 0.03 and h > proc_h * 0.18:
-            score -= 1.0
-
-        if score < 2.6:
-            continue
-
-        cls = "window"
-        if door_like:
-            cls = "door"
-
-        candidates.append(
-            {
+        if score > best_score:
+            best_score = score
+            best = {
                 "x": int(x),
                 "y": int(y),
                 "width": int(w),
                 "height": int(h),
-                "score": float(score),
-                "class": cls,
+                "area_px": float(area),
+                "aspect_ratio": round(float(aspect), 2),
+                "score": round(float(score), 2),
+                "mask": mask,
             }
-        )
 
-    if not candidates:
-        return []
+    return best
 
-    candidates = non_max_suppression(candidates, iou_threshold=0.24)
 
-    # Rescale naar origineel
-    inv = 1.0 / scale
-    results: list[dict[str, Any]] = []
+def detect_brick_facade(image_bgr: np.ndarray, marker_box: dict[str, Any] | None) -> dict[str, Any] | None:
+    """
+    Ruwe detectie van de gevel.
+    Doel: een bruikbare eerste MVP, niet exact.
+    """
+    img_h, img_w = image_bgr.shape[:2]
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
-    for c in candidates:
-        x = int(round(c["x"] * inv))
-        y = int(round(c["y"] * inv))
-        w = int(round(c["width"] * inv))
-        h = int(round(c["height"] * inv))
+    # Baksteen zit vaak in rood/oranje/bruin gebied, maar niet altijd.
+    # Daarom combineren we kleur + textuur/edges.
+    h = hsv[:, :, 0]
+    s = hsv[:, :, 1]
+    v = hsv[:, :, 2]
 
-        clipped = clip_box(x, y, w, h, original_w, original_h)
-        clipped["class"] = c["class"]
-        clipped["_score"] = round(float(c["score"]), 3)
-        results.append(clipped)
+    brick_color_mask = (
+        (((h >= 3) & (h <= 25)) | ((h >= 170) & (h <= 179))) &
+        (s >= 40) &
+        (v >= 40) &
+        (v <= 230)
+    )
 
-    # nog eens ruis na rescale weg
-    cleaned: list[dict[str, Any]] = []
-    min_area = (original_w * original_h) * 0.0025
+    # Lokale textuur via Laplacian/Canny
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blur, 60, 160)
+    edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
 
-    for r in results:
-        area = r["width"] * r["height"]
-        if area < min_area:
+    texture_mask = edges > 0
+
+    # Gecombineerde facade-kans
+    combined = np.zeros((img_h, img_w), dtype=np.uint8)
+    combined[brick_color_mask | texture_mask] = 255
+
+    # Marker liefst ook mee opnemen als deel van de gevel
+    if marker_box is not None:
+        mx, my, mw, mh = marker_box["x"], marker_box["y"], marker_box["width"], marker_box["height"]
+        pad_x = int(max(20, mw * 4))
+        pad_y = int(max(20, mh * 2))
+        x1 = max(0, mx - pad_x)
+        y1 = max(0, my - pad_y)
+        x2 = min(img_w, mx + mw + pad_x)
+        y2 = min(img_h, my + mh + pad_y)
+        combined[y1:y2, x1:x2] = 255
+
+    # Sluit gaten zodat baksteenpatronen samensmelten tot één regio
+    kernel_close1 = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 25))
+    kernel_close2 = cv2.getStructuringElement(cv2.MORPH_RECT, (45, 45))
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel_close1, iterations=2)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel_close2, iterations=1)
+
+    # Verwijder kleine stukken
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, np.ones((7, 7), np.uint8), iterations=1)
+
+    contours, _ = cv2.findContours(combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    best = None
+    best_score = -1.0
+    image_area = img_h * img_w
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < image_area * 0.03:
             continue
-        cleaned.append(r)
 
-    # Sorteer logisch
-    cleaned = sorted(cleaned, key=lambda b: (round(b["y"] / 120), b["x"]))
-    return cleaned
+        x, y, w, h = cv2.boundingRect(cnt)
+        rect_area = max(w * h, 1)
+        fill_ratio = area / rect_area
+
+        # vermoedelijke geveloppervlakte: groot, redelijk rechthoekig
+        score = 0.0
+        score += min(area / image_area * 30, 18.0)
+        score += fill_ratio * 5.0
+
+        # Bonus als marker binnen of dicht bij de contour zit
+        if marker_box is not None:
+            mx = marker_box["x"] + marker_box["width"] / 2
+            my = marker_box["y"] + marker_box["height"] / 2
+            if x <= mx <= x + w and y <= my <= y + h:
+                score += 6.0
+
+        # Straf wanneer de contour bijna de hele foto is
+        if area > image_area * 0.92:
+            score -= 6.0
+
+        # gevel is meestal hoger dan 20% van beeldhoogte en breder dan 20% van beeldbreedte
+        if w < img_w * 0.2 or h < img_h * 0.2:
+            score -= 5.0
+
+        if score > best_score:
+            best_score = score
+            best = {
+                "x": int(x),
+                "y": int(y),
+                "width": int(w),
+                "height": int(h),
+                "area_px": float(area),
+                "fill_ratio": round(float(fill_ratio), 3),
+                "score": round(float(score), 2),
+            }
+
+    if best is None:
+        return None
+
+    # Maak de box iets strakker via projecties binnen ROI
+    x, y, w, h = best["x"], best["y"], best["width"], best["height"]
+    roi = combined[y:y + h, x:x + w]
+
+    col_sum = np.sum(roi > 0, axis=0)
+    row_sum = np.sum(roi > 0, axis=1)
+
+    col_thresh = max(5, int(h * 0.12))
+    row_thresh = max(5, int(w * 0.12))
+
+    valid_cols = np.where(col_sum > col_thresh)[0]
+    valid_rows = np.where(row_sum > row_thresh)[0]
+
+    if len(valid_cols) > 0 and len(valid_rows) > 0:
+        x1 = x + int(valid_cols[0])
+        x2 = x + int(valid_cols[-1])
+        y1 = y + int(valid_rows[0])
+        y2 = y + int(valid_rows[-1])
+
+        new_x = x1
+        new_y = y1
+        new_w = max(1, x2 - x1 + 1)
+        new_h = max(1, y2 - y1 + 1)
+
+        new_x, new_y, new_w, new_h = safe_box(new_x, new_y, new_w, new_h, img_w, img_h)
+
+        best["x"] = new_x
+        best["y"] = new_y
+        best["width"] = new_w
+        best["height"] = new_h
+
+    return best
 
 
-def split_results(openings: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    windows: list[dict[str, Any]] = []
-    doors: list[dict[str, Any]] = []
+def build_response(
+    marker: dict[str, Any] | None,
+    facade: dict[str, Any] | None,
+    scale_x: float,
+    scale_y: float,
+    original_shape: tuple[int, int, int],
+    processing_scale: float,
+) -> dict[str, Any]:
+    img_h, img_w = original_shape[:2]
 
-    for o in openings:
-        item = {
-            "x": o["x"],
-            "y": o["y"],
-            "width": o["width"],
-            "height": o["height"],
+    result: dict[str, Any] = {
+        "reference_detected": marker is not None,
+        "marker": None,
+        "facade": None,
+        "facade_width_cm": None,
+        "facade_height_cm": None,
+        "facade_area_m2": None,
+        "windows": [],  # compatibel houden met je huidige frontend
+        "warning": None,
+        "debug": {
+            "image_width_px": img_w,
+            "image_height_px": img_h,
+            "processing_scale": round(float(processing_scale), 4),
+        },
+    }
+
+    if marker is not None:
+        result["marker"] = {
+            "x": clamp_int(marker["x"] * scale_x),
+            "y": clamp_int(marker["y"] * scale_y),
+            "width": clamp_int(marker["width"] * scale_x),
+            "height": clamp_int(marker["height"] * scale_y),
+            "height_cm_real": MARKER_REAL_HEIGHT_CM,
         }
-        if o.get("class") == "door":
-            doors.append(item)
+
+    if facade is not None:
+        fx = clamp_int(facade["x"] * scale_x)
+        fy = clamp_int(facade["y"] * scale_y)
+        fw = clamp_int(facade["width"] * scale_x)
+        fh = clamp_int(facade["height"] * scale_y)
+
+        result["facade"] = {
+            "x": fx,
+            "y": fy,
+            "width": fw,
+            "height": fh,
+        }
+
+        if marker is not None and marker["height"] > 0:
+            cm_per_px = MARKER_REAL_HEIGHT_CM / float(marker["height"])
+            facade_width_cm = facade["width"] * cm_per_px
+            facade_height_cm = facade["height"] * cm_per_px
+            facade_area_m2 = (facade_width_cm * facade_height_cm) / 10000.0
+
+            result["facade_width_cm"] = round(float(facade_width_cm), 1)
+            result["facade_height_cm"] = round(float(facade_height_cm), 1)
+            result["facade_area_m2"] = round(float(facade_area_m2), 2)
         else:
-            windows.append(item)
+            result["warning"] = "Marker niet betrouwbaar genoeg gedetecteerd om schaal te berekenen."
 
-    return windows, doors
+    if marker is None:
+        result["warning"] = "Marker niet gedetecteerd."
+    elif facade is None:
+        result["warning"] = "Gevel niet gedetecteerd."
 
+    return result
 
-# =========================
-# API
-# =========================
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"status": "ok", "message": "Gevel opening detection API actief."}
+    return {"status": "ok", "message": "Gevel Calculator API draait."}
 
 
 @app.post("/analyze")
-async def analyze(image: UploadFile = File(...)) -> JSONResponse:
+async def analyze(
+    image: UploadFile = File(...),
+    marker: UploadFile = File(...),
+) -> JSONResponse:
     try:
-        raw = await image.read()
-        img = read_upload_image(raw)
-        img_h, img_w = img.shape[:2]
+        image_bytes = await image.read()
+        marker_bytes = await marker.read()
 
-        openings = detect_openings_from_facade(img)
-        windows, doors = split_results(openings)
+        original_img = read_upload_image(image_bytes)
+        marker_img = read_upload_image(marker_bytes)
 
-        response: dict[str, Any] = {
-            "success": True,
-            "image_width": img_w,
-            "image_height": img_h,
-            "openings": openings,
-            "opening_count": len(openings),
-            "windows": windows,
-            "window_count": len(windows),
-            "doors": doors,
-            "door_count": len(doors),
-        }
+        proc_img, proc_scale = resize_for_processing(original_img, max_dim=1600)
+        proc_marker_img, _ = resize_for_processing(marker_img, max_dim=600)
 
-        if len(openings) == 0:
-            response["warning"] = "Geen duidelijke openingen gedetecteerd."
+        detected_marker = detect_marker(proc_img, proc_marker_img)
+        detected_facade = detect_brick_facade(proc_img, detected_marker)
 
-        return JSONResponse(content=response)
+        # van processing-image terug naar originele pixelcoördinaten
+        inv_scale = 1.0 / proc_scale
+        result = build_response(
+            marker=detected_marker,
+            facade=detected_facade,
+            scale_x=inv_scale,
+            scale_y=inv_scale,
+            original_shape=original_img.shape,
+            processing_scale=proc_scale,
+        )
+
+        return JSONResponse(content=result)
 
     except ValueError as exc:
         return JSONResponse(
             status_code=400,
-            content={"success": False, "error": str(exc)},
+            content={"error": str(exc), "reference_detected": False, "windows": []},
         )
     except Exception as exc:
         return JSONResponse(
             status_code=500,
-            content={"success": False, "error": f"Interne fout: {str(exc)}"},
+            content={
+                "error": f"Interne fout: {str(exc)}",
+                "reference_detected": False,
+                "windows": [],
+            },
         )
