@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 import shutil
 import tempfile
@@ -25,8 +24,6 @@ ROBOFLOW_API_URL = "https://detect.roboflow.com"
 ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "VtnRHY1p1oVlLMgwj6zA")
 ROBOFLOW_WORKSPACE = "axels-workspace-lm5wm"
 ROBOFLOW_WORKFLOW_ID = "find-fluorescent-rulers-and-windows"
-
-# Werkelijke hoogte van jouw fluomarker
 MARKER_REAL_HEIGHT_CM = 40.0
 
 client = InferenceHTTPClient(
@@ -43,10 +40,6 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 
 def extract_predictions(result: Any) -> list[dict[str, Any]]:
-    """
-    Probeert Roboflow workflow output robuust uit te lezen.
-    Ondersteunt meerdere mogelijke response-vormen.
-    """
     predictions: list[dict[str, Any]] = []
 
     def walk(node: Any) -> None:
@@ -60,7 +53,6 @@ def extract_predictions(result: Any) -> list[dict[str, Any]]:
         if not isinstance(node, dict):
             return
 
-        # Veelvoorkomende keys
         for key in ("predictions", "detections"):
             maybe = node.get(key)
             if isinstance(maybe, list):
@@ -68,38 +60,15 @@ def extract_predictions(result: Any) -> list[dict[str, Any]]:
                     if isinstance(item, dict):
                         predictions.append(item)
 
-        # Soms zit het nog dieper
         for value in node.values():
             if isinstance(value, (dict, list)):
                 walk(value)
 
     walk(result)
-
-    # Deduplicatie op basis van kernvelden
-    unique: list[dict[str, Any]] = []
-    seen: set[tuple[Any, ...]] = set()
-
-    for p in predictions:
-        sig = (
-            p.get("class"),
-            p.get("label"),
-            p.get("x"),
-            p.get("y"),
-            p.get("width"),
-            p.get("height"),
-            p.get("confidence"),
-        )
-        if sig not in seen:
-            seen.add(sig)
-            unique.append(p)
-
-    return unique
+    return predictions
 
 
 def prediction_to_box(pred: dict[str, Any]) -> dict[str, Any]:
-    """
-    Zet center-based bbox om naar top-left bbox.
-    """
     x_center = float(pred.get("x", 0))
     y_center = float(pred.get("y", 0))
     width = float(pred.get("width", 0))
@@ -122,21 +91,20 @@ def prediction_to_box(pred: dict[str, Any]) -> dict[str, Any]:
 
 def is_window_label(label: str) -> bool:
     label = label.lower()
-    return any(word in label for word in ["window", "raam", "windows"])
+    return "window" in label or "raam" in label
 
 
 def is_marker_label(label: str) -> bool:
     label = label.lower()
-    return any(word in label for word in ["ruler", "marker", "scale", "lat"])
+    return (
+        "ruler" in label
+        or "marker" in label
+        or "scale" in label
+        or "lat" in label
+    )
 
 
-def add_measurements(
-    windows: list[dict[str, Any]],
-    marker: dict[str, Any] | None,
-) -> tuple[list[dict[str, Any]], float | None]:
-    """
-    Berekent cm-afmetingen op basis van markerhoogte van 40 cm.
-    """
+def add_measurements(windows: list[dict[str, Any]], marker: dict[str, Any] | None):
     if not marker or marker["height"] <= 0:
         return windows, None
 
@@ -144,8 +112,7 @@ def add_measurements(
     if px_per_cm <= 0:
         return windows, None
 
-    measured_windows: list[dict[str, Any]] = []
-
+    measured = []
     for w in windows:
         width_cm = round(w["width"] / px_per_cm, 1)
         height_cm = round(w["height"] / px_per_cm, 1)
@@ -155,27 +122,45 @@ def add_measurements(
         item["width_cm"] = width_cm
         item["height_cm"] = height_cm
         item["area_m2"] = area_m2
-        measured_windows.append(item)
+        measured.append(item)
 
-    return measured_windows, px_per_cm
+    return measured, px_per_cm
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "API draait"}
 
 
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health():
     return {"status": "ok"}
 
 
 @app.post("/analyze")
-async def analyze(image: UploadFile = File(...)) -> JSONResponse:
+async def analyze(
+    image: UploadFile | None = File(default=None),
+    file: UploadFile | None = File(default=None),
+):
     temp_path: str | None = None
 
     try:
-        suffix = os.path.splitext(image.filename or "")[1].lower()
+        upload = image or file
+
+        if upload is None:
+            return JSONResponse(
+                {
+                    "error": "Geen afbeelding ontvangen. Verwacht form-data veld 'image'."
+                },
+                status_code=400,
+            )
+
+        suffix = os.path.splitext(upload.filename or "")[1].lower()
         if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
             suffix = ".jpg"
 
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            shutil.copyfileobj(image.file, tmp)
+            shutil.copyfileobj(upload.file, tmp)
             temp_path = tmp.name
 
         result = client.run_workflow(
@@ -187,8 +172,8 @@ async def analyze(image: UploadFile = File(...)) -> JSONResponse:
 
         predictions = extract_predictions(result)
 
-        windows: list[dict[str, Any]] = []
-        marker_candidates: list[dict[str, Any]] = []
+        windows = []
+        marker_candidates = []
 
         for pred in predictions:
             box = prediction_to_box(pred)
@@ -202,7 +187,6 @@ async def analyze(image: UploadFile = File(...)) -> JSONResponse:
             elif is_marker_label(label):
                 marker_candidates.append(box)
 
-        # Neem de meest waarschijnlijke marker
         marker = None
         if marker_candidates:
             marker = sorted(
@@ -211,11 +195,7 @@ async def analyze(image: UploadFile = File(...)) -> JSONResponse:
                 reverse=True,
             )[0]
 
-        windows = sorted(
-            windows,
-            key=lambda w: (w["x"], w["y"])
-        )
-
+        windows = sorted(windows, key=lambda w: (w["x"], w["y"]))
         windows, px_per_cm = add_measurements(windows, marker)
 
         response = {
