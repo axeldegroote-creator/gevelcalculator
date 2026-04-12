@@ -2,9 +2,5 @@ services:
   - type: web
     name: gevelcalculator-api
     env: python
-    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
-    envVars:
-      - key: ROBOFLOW_API_KEY
-        value: VtnRHY1p1oVlLMgwj6zA
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
