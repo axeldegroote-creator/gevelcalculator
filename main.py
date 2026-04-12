@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import os
-import shutil
 import tempfile
 from typing import Any
 
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from inference_sdk import InferenceHTTPClient
@@ -91,17 +90,12 @@ def prediction_to_box(pred: dict[str, Any]) -> dict[str, Any]:
 
 def is_window_label(label: str) -> bool:
     label = label.lower()
-    return "window" in label or "raam" in label
+    return any(word in label for word in ["window", "raam", "windows"])
 
 
 def is_marker_label(label: str) -> bool:
     label = label.lower()
-    return (
-        "ruler" in label
-        or "marker" in label
-        or "scale" in label
-        or "lat" in label
-    )
+    return any(word in label for word in ["ruler", "marker", "scale", "lat"])
 
 
 def add_measurements(windows: list[dict[str, Any]], marker: dict[str, Any] | None):
@@ -138,29 +132,46 @@ async def health():
 
 
 @app.post("/analyze")
-async def analyze(
-    image: UploadFile | None = File(default=None),
-    file: UploadFile | None = File(default=None),
-):
+async def analyze(request: Request):
     temp_path: str | None = None
 
     try:
-        upload = image or file
+        content_type = request.headers.get("content-type", "")
 
-        if upload is None:
+        if "multipart/form-data" not in content_type:
             return JSONResponse(
                 {
-                    "error": "Geen afbeelding ontvangen. Verwacht form-data veld 'image'."
+                    "error": f"Verkeerd content-type: {content_type}. Verwacht multipart/form-data."
                 },
                 status_code=400,
             )
 
-        suffix = os.path.splitext(upload.filename or "")[1].lower()
+        form = await request.form()
+
+        upload = form.get("image") or form.get("file") or form.get("photo")
+
+        if upload is None:
+            return JSONResponse(
+                {
+                    "error": "Geen afbeelding ontvangen. Verwachte veldnaam: image, file of photo."
+                },
+                status_code=400,
+            )
+
+        filename = getattr(upload, "filename", "upload.jpg") or "upload.jpg"
+        suffix = os.path.splitext(filename)[1].lower()
         if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
             suffix = ".jpg"
 
+        file_bytes = await upload.read()
+        if not file_bytes:
+            return JSONResponse(
+                {"error": "Bestand is leeg."},
+                status_code=400,
+            )
+
         with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            shutil.copyfileobj(upload.file, tmp)
+            tmp.write(file_bytes)
             temp_path = tmp.name
 
         result = client.run_workflow(
