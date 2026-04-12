@@ -32,7 +32,7 @@ def home():
     return {"status": "Wall Measurement API is running"}
 
 @app.post("/measure-wall")
-async def measure_wall(file: UploadFile = File(...)):
+async def measure_wall(file: UploadFile = file(...)):
     if not API_KEY:
         raise HTTPException(status_code=500, detail="Roboflow API Key not configured on server.")
 
