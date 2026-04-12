@@ -1,6 +1,9 @@
 services:
   - type: web
-    name: gevelcalculator-api
+    name: wall-area-service
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ROBOFLOW_API_KEY
+        sync: false # You will enter this manually in the Render UI for security
