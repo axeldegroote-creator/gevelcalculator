@@ -14,7 +14,7 @@ ROBOFLOW_WORKFLOW_ID = os.environ.get("ROBOFLOW_WORKFLOW_ID", "find-windows-2")
 if not ROBOFLOW_API_KEY:
     raise RuntimeError("ROBOFLOW_API_KEY ontbreekt in de environment variables.")
 
-app = FastAPI(title="Window Detector API")
+app = FastAPI(title="Gevel Calculator API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,19 +29,16 @@ client = InferenceHTTPClient(
     api_key=ROBOFLOW_API_KEY,
 )
 
-
 @app.get("/")
-async def root() -> dict[str, str]:
+async def root():
     return {"status": "ok"}
 
-
 @app.get("/health")
-async def health() -> dict[str, str]:
+async def health():
     return {"status": "healthy"}
 
-
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)) -> JSONResponse:
+async def analyze(file: UploadFile = File(...)):
     if not file:
         raise HTTPException(status_code=400, detail="Geen bestand ontvangen.")
 
@@ -53,6 +50,11 @@ async def analyze(file: UploadFile = File(...)) -> JSONResponse:
     if not image_bytes:
         raise HTTPException(status_code=400, detail="Leeg bestand ontvangen.")
 
+    print("BESTAND ONTVANGEN")
+    print("filename:", file.filename)
+    print("content_type:", file.content_type)
+    print("size:", len(image_bytes))
+
     try:
         result: Any = client.run_workflow(
             workspace_name=ROBOFLOW_WORKSPACE,
@@ -60,6 +62,8 @@ async def analyze(file: UploadFile = File(...)) -> JSONResponse:
             images={"image": image_bytes},
             use_cache=True,
         )
+        print("ROBOFLOW RESULT:", result)
         return JSONResponse(content=result)
     except Exception as exc:
+        print("ROBOFLOW ERROR:", str(exc))
         raise HTTPException(status_code=500, detail=f"Roboflow fout: {str(exc)}") from exc
