@@ -1,11 +1,21 @@
 import os
-from fastapi import FastAPI, UploadFile, File
+from typing import Any
+
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from inference_sdk import InferenceHTTPClient
 
-app = FastAPI()
+ROBOFLOW_API_KEY = os.environ.get("ROBOFLOW_API_KEY")
+ROBOFLOW_API_URL = os.environ.get("ROBOFLOW_API_URL", "https://detect.roboflow.com")
+ROBOFLOW_WORKSPACE = os.environ.get("ROBOFLOW_WORKSPACE", "axels-workspace-lm5wm")
+ROBOFLOW_WORKFLOW_ID = os.environ.get("ROBOFLOW_WORKFLOW_ID", "find-windows-2")
 
-# CORS (nodig voor CodePen)
+if not ROBOFLOW_API_KEY:
+    raise RuntimeError("ROBOFLOW_API_KEY ontbreekt in de environment variables.")
+
+app = FastAPI(title="Window Detector API")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -14,30 +24,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Roboflow client
 client = InferenceHTTPClient(
-    api_url="https://detect.roboflow.com",
-    api_key=os.environ.get("ROBOFLOW_API_KEY")  # zet deze in Render
+    api_url=ROBOFLOW_API_URL,
+    api_key=ROBOFLOW_API_KEY,
 )
 
+
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/health")
+async def health() -> dict[str, str]:
+    return {"status": "healthy"}
+
+
 @app.post("/analyze")
-async def analyze(file: UploadFile = File(...)):
-    
-    # 🔥 HIER komt de fix
+async def analyze(file: UploadFile = File(...)) -> JSONResponse:
+    if not file:
+        raise HTTPException(status_code=400, detail="Geen bestand ontvangen.")
+
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Upload een geldig image-bestand.")
+
     image_bytes = await file.read()
 
-    print(f"Image size: {len(image_bytes)} bytes")  # debug
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Leeg bestand ontvangen.")
 
-    # 🔥 HIER gebruik je die in je workflow
-    result = client.run_workflow(
-        workspace_name="axels-workspace-lm5wm",
-        workflow_id="find-windows-2",
-        images={
-            "image": image_bytes
-        },
-        use_cache=True
-    )
-
-    print(result)  # debug
-
-    return result
+    try:
+        result: Any = client.run_workflow(
+            workspace_name=ROBOFLOW_WORKSPACE,
+            workflow_id=ROBOFLOW_WORKFLOW_ID,
+            images={"image": image_bytes},
+            use_cache=True,
+        )
+        return JSONResponse(content=result)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Roboflow fout: {str(exc)}") from exc
